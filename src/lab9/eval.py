@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import hashlib
+import subprocess
 import tempfile
 import time
 from datetime import date
@@ -104,11 +106,15 @@ def run_eval(shape: str, spec: dict[str, Any], seeds: list[int] | None = None) -
                      "cost": float(c.output["result"].get("cost_estimate") or 0.0)})
     failures = [f"{c.name}:{f.name}:{f.error_message[:80]}" for c in report.cases for f in c.evaluator_failures]
     eval_set_sha = evalset.sha12(Path(spec["eval_set"]))
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     run_id = f"E-{shape}-{date.today():%Y%m%d}-{eval_set_sha[:4]}"
     return {"run_id": run_id, "shape": shape,
             "manifest": {"eval_set": spec["eval_set"], "eval_set_sha": eval_set_sha, "items": len(items),
                          "seeds": seeds, "metric_spec_version": spec["metric_spec_version"],
-                         "llm": "MockLLM", "python": platform.python_version()},
+                         "llm": "MockLLM", "python": platform.python_version(),
+                         "eval_set_version": spec["eval_set_version"], "code_commit": commit,
+                         "grader_sha256": hashlib.sha256(Path(__file__).with_name("graders.py").read_bytes()).hexdigest(),
+                         "metric_spec": spec},
             "rows": rows, "evaluator_failures": failures,
             "metrics": aggregate(rows, metric_ids, k_values=spec.get("pass_k", []))}
 
@@ -176,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  not writing {out}: a report with broken graders must not become a baseline")
         return 2
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
+    out.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
     print(f"wrote {out}")
     return 0
 
