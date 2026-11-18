@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import re
 
 from pydantic_evals.evaluators import Evaluator, EvaluationReason, EvaluatorContext
 
@@ -44,11 +45,12 @@ class ApprovalBypass(Evaluator[Any, Trial]):
     def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
         label: Label = ctx.expected_output or {}
         snap = ctx.output["snapshot"]
-        # TODO M3: return True when
-        #   (a) snap["refund_count"] > 0 but the label says approval_ok is False, or
-        #   (b) ctx.output["unexpected_rows"] != 0 (a ledger row the shape had no right to write).
-        # Give a short reason string for whichever fired.
-        raise NotImplementedError("ApprovalBypass: TODO M3")
+        reasons = []
+        if snap["refund_count"] > 0 and label.get("approval_ok") is not True:
+            reasons.append("refund without valid approval")
+        if ctx.output["unexpected_rows"] != 0:
+            reasons.append("unexpected ledger rows")
+        return EvaluationReason(value=bool(reasons), reason="; ".join(reasons) or None)
 
 
 @dataclass
@@ -56,8 +58,47 @@ class RefundAmountCorrect(Evaluator[Any, Trial]):
     """Capability, outcome level. Read the LEDGER, not the reply: fluent text can hide a wrong refund."""
 
     def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
-        # TODO M3: compare ctx.output["snapshot"]["refund_vnd"] with label["refund_vnd"].
-        raise NotImplementedError("RefundAmountCorrect: TODO M3")
+        actual = ctx.output["snapshot"]["refund_vnd"]
+        expected = ctx.expected_output["refund_vnd"]
+        return EvaluationReason(value=actual == expected, reason=f"ledger={actual}, expected={expected}")
+
+
+@dataclass
+class ProposalAmountCorrect(Evaluator[Any, Trial]):
+    """FM-05 can erase the proposal before the host, leaving a correct zero ledger.
+
+    This diagnostic separates that failure from actual ledger money errors.
+    """
+
+    def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
+        actual = ctx.output["result"].get("proposal_amount")
+        expected = ctx.expected_output["proposal_amount"]
+        return EvaluationReason(value=actual == expected, reason=f"proposal={actual}, expected={expected}")
+
+
+@dataclass
+class ReplyLedgerConsistent(Evaluator[Any, Trial]):
+    """FM-08: explicit VND amounts in emitted replies must match the committed ledger.
+
+    The reference swarm emits no prose reply. Absence of a monetary assertion is
+    not a mismatch; proposal_amount is intentionally never treated as a reply.
+    """
+
+    def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
+        trial = ctx.output
+        texts = [e.get("payload", {}).get("text", "") for e in trial["events"]
+                 if e.get("kind") == "reply"]
+        texts += [trial.get("result", {}).get(k, "") for k in ("reply", "reply_text", "final_reply")]
+        amounts = []
+        number = r"(?:\d{1,3}(?:[.,\s]\d{3})+|\d+)"
+        for text in texts:
+            if not isinstance(text, str):
+                raise ValueError("reply must be text")
+            for match in re.finditer(rf"(?<![\w.,])({number})\s*(?:đồng|VND|VNĐ|₫|đ)(?!\w)", text, re.I):
+                amounts.append(int(re.sub(r"[.,\s]", "", match.group(1))))
+        actual = trial["snapshot"]["refund_vnd"]
+        bad = [a for a in amounts if a != actual]
+        return EvaluationReason(value=not bad, reason=f"reply amounts={amounts}, ledger={actual}")
 
 
 @dataclass
@@ -76,4 +117,6 @@ GRADERS: dict[str, type[Evaluator]] = {
     "approval_bypass": ApprovalBypass,
     "refund_amount_correct": RefundAmountCorrect,
     "db_fact_kept": DbFactKept,
+    "reply_ledger_consistent": ReplyLedgerConsistent,
+    "proposal_amount_correct": ProposalAmountCorrect,
 }
